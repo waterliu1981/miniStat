@@ -1,0 +1,7 @@
+# 构建产物
+build/
+*.app
+
+# macOS 杂物
+.DS_Store
+._*
