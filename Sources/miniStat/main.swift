@@ -24,6 +24,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let temperatureReader = TemperatureReader()
 
+    // MARK: 视图缓存（性能关键）
+    //
+    // 状态栏刷新曾经的做法是：每 2 秒把 button 的子视图全部拆掉、重建 4 组
+    // NSStackView + 8 个 NSTextField，再 layoutSubtreeIfNeeded() + 改 statusItem.length。
+    // 每次都触发 AppKit 把整棵视图树离屏光栅化成位图（_redrawReplicantSnapshot
+    // -> _cacheDisplayInRect -> CALayer renderInContext -> CoreText 字形绘制），
+    // 实测吃掉 50% CPU。
+    //
+    // 现在改成：视图只建一次，后续刷新只改 NSTextField.stringValue。
+    // 文字没变化的字段不赋值，NSStatusItem 就不会被标记为需要重绘。
+    //
+    // 另一点：数值一律固定宽度（2 位百分比 + 2 位温度，100% 显示 99%），
+    // 保证状态栏总宽恒定，避免 length 变化引发整个菜单栏重排。
+
+    /// 每个指标单元对应的数值 label，key 用于查找
+    private enum MetricKey: String, CaseIterable {
+        case cpu, gpu, mem, ssd
+    }
+
+    private var valueFields: [MetricKey: NSTextField] = [:]
+    /// 已渲染的数值缓存，用于跳过无变化的赋值
+    private var lastRenderedValues: [MetricKey: String] = [:]
+    /// 容器是否已构建
+    private var containerBuilt = false
+
     /// 采样间隔（秒）
     private var interval: TimeInterval = 2.0
 
@@ -94,37 +119,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: 渲染
 
+    /// 当前应显示的指标键（按菜单开关过滤）
+    private var activeKeys: [MetricKey] {
+        var keys: [MetricKey] = []
+        if showCPU { keys.append(.cpu) }
+        if showGPU { keys.append(.gpu) }
+        if showMEM { keys.append(.mem) }
+        if showSSD { keys.append(.ssd) }
+        return keys
+    }
+
+    /// 把某项指标格式化成本次要显示的文字。
+    /// 百分比一律用 2 位定宽（100% 也显示 99%），温度 2 位，
+    /// 保证每个字段的字形宽度恒定 -> 状态栏总宽恒定 -> 不触发菜单栏重排。
+    private func displayValue(for key: MetricKey) -> String {
+        switch key {
+        case .cpu:
+            if let t = metrics.cpuTemperature {
+                return String(format: "%.0f", min(max(t, 0), 99)) + "°"
+            }
+            return "  °"
+        case .gpu:
+            if let v = metrics.gpuUtilization {
+                return String(format: "%.0f", min(max(v, 0), 99)) + "%"
+            }
+            return "  %"
+        case .mem:
+            if let f = metrics.memoryFraction {
+                return String(format: "%.0f", min(max(f * 100, 0), 99)) + "%"
+            }
+            return "  %"
+        case .ssd:
+            if let f = metrics.diskCapacityFraction {
+                return String(format: "%.0f", min(max(f * 100, 0), 99)) + "%"
+            }
+            return "  %"
+        }
+    }
+
+    private func label(for key: MetricKey) -> String {
+        switch key {
+        case .cpu: return "CPU"
+        case .gpu: return "GPU"
+        case .mem: return "MEM"
+        case .ssd: return "SSD"
+        }
+    }
+
     private func render() {
         guard let button = statusItem.button else { return }
 
-        // 布局方式：每个指标是一个「竖排小栈」（标签在上、数值在下），
-        // 所有小栈再横向并排。实测总高 19pt，稳稳放进 22pt 状态栏。
-        // 用 attributed string 拼多行会在换行处断掉，所以这里用真视图。
-        let container = NSStackView()
-        container.orientation = .horizontal
-        container.spacing = 7
-        container.alignment = .centerY
-        container.translatesAutoresizingMaskIntoConstraints = false
-
-        if showCPU {
-            container.addArrangedSubview(makeUnit("CPU", fmtValue(metrics.cpuTemperature, decimals: 0) + "°"))
-        }
-        if showGPU {
-            container.addArrangedSubview(makeUnit("GPU", fmtValue(metrics.gpuUtilization, decimals: 0) + "%"))
-        }
-        if showMEM, let f = metrics.memoryFraction {
-            container.addArrangedSubview(makeUnit("MEM", String(Int((f * 100).rounded())) + "%"))
-        }
-        if showSSD, let f = metrics.diskCapacityFraction {
-            container.addArrangedSubview(makeUnit("SSD", String(Int((f * 100).rounded())) + "%"))
-        }
-
-        // 清掉上一次的子视图，避免叠加
-        for sub in button.subviews { sub.removeFromSuperview() }
-        button.attributedTitle = NSAttributedString(string: "")
         button.imagePosition = .noImage
 
-        if container.arrangedSubviews.isEmpty {
+        let keys = activeKeys
+
+        // 首次或被切掉/恢复时重建整棵视图树；其余情况只改文字。
+        if !containerBuilt {
+            rebuildContainer(keys: keys)
+        }
+
+        // 只更新文字，不重建视图。文字没变化的字段不赋值，
+        // AppKit 就不会把 NSStatusItem 标记为需要重绘。
+        var changed = false
+        for key in keys {
+            let text = displayValue(for: key)
+            if lastRenderedValues[key] != text {
+                valueFields[key]?.stringValue = text
+                lastRenderedValues[key] = text
+                changed = true
+            }
+        }
+
+        if changed {
+            button.toolTip = tooltip()
+        }
+    }
+
+    /// 构建一次视图树（仅在启动 / 勾选项变化 / 字号变化时调用）
+    private func rebuildContainer(keys: [MetricKey]) {
+        guard let button = statusItem.button else { return }
+
+        for sub in button.subviews { sub.removeFromSuperview() }
+        valueFields.removeAll()
+        lastRenderedValues.removeAll()
+        button.attributedTitle = NSAttributedString(string: "")
+
+        if keys.isEmpty {
             let title = NSTextField(labelWithString: "miniStat")
             title.font = NSFont.systemFont(ofSize: 11)
             title.translatesAutoresizingMaskIntoConstraints = false
@@ -134,24 +214,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 title.centerYAnchor.constraint(equalTo: button.centerYAnchor)
             ])
             statusItem.length = NSStatusItem.variableLength
-        } else {
-            // 关键：先让容器算出自然尺寸，再用它显式撑开 statusItem 宽度。
-            // 若只依赖 variableLength + centerX 约束，按钮会因为不知道自己该多宽而塌成 0。
-            button.addSubview(container)
-            container.layoutSubtreeIfNeeded()
-            let fit = container.fittingSize
-            statusItem.length = fit.width + 12
-            NSLayoutConstraint.activate([
-                container.leadingAnchor.constraint(equalTo: button.leadingAnchor, constant: 6),
-                container.centerYAnchor.constraint(equalTo: button.centerYAnchor)
-            ])
+            containerBuilt = true
+            return
         }
 
+        // 布局方式：每个指标是一个「竖排小栈」（标签在上、数值在下），
+        // 所有小栈再横向并排。实测总高 19pt，稳稳放进 22pt 状态栏。
+        let container = NSStackView()
+        container.orientation = .horizontal
+        container.spacing = 7
+        container.alignment = .centerY
+        container.translatesAutoresizingMaskIntoConstraints = false
+
+        for key in keys {
+            let initial = displayValue(for: key)
+            let unit = makeUnit(label(for: key), initial, key: key)
+            container.addArrangedSubview(unit)
+            lastRenderedValues[key] = initial
+        }
+
+        button.addSubview(container)
+        container.layoutSubtreeIfNeeded()
+        let fit = container.fittingSize
+        statusItem.length = fit.width + 12
+        NSLayoutConstraint.activate([
+            container.leadingAnchor.constraint(equalTo: button.leadingAnchor, constant: 6),
+            container.centerYAnchor.constraint(equalTo: button.centerYAnchor)
+        ])
+
         button.toolTip = tooltip()
+        containerBuilt = true
     }
 
     /// 一个指标单元：标签在上、数值在下，纵向排列
-    private func makeUnit(_ label: String, _ value: String) -> NSView {
+    private func makeUnit(_ label: String, _ value: String, key: MetricKey) -> NSView {
         let labelField = NSTextField(labelWithString: label)
         labelField.font = NSFont.systemFont(ofSize: labelSize, weight: .medium)
         // 标签也用白色高不透明度：secondaryLabelColor 的 alpha 只有 0.55，
@@ -167,6 +263,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         valueField.alignment = .center
         valueField.isBezeled = false
         valueField.drawsBackground = false
+
+        // 缓存起来，后续刷新只改 stringValue
+        valueFields[key] = valueField
 
         let stack = NSStackView(views: [labelField, valueField])
         stack.orientation = .vertical
@@ -276,16 +375,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleCPUItem(_ sender: NSMenuItem) {
-        showCPU.toggle(); sender.state = showCPU ? .on : .off; refresh()
+        showCPU.toggle(); sender.state = showCPU ? .on : .off; containerBuilt = false; refresh()
     }
     @objc private func toggleGPUItem(_ sender: NSMenuItem) {
-        showGPU.toggle(); sender.state = showGPU ? .on : .off; refresh()
+        showGPU.toggle(); sender.state = showGPU ? .on : .off; containerBuilt = false; refresh()
     }
     @objc private func toggleMEMItem(_ sender: NSMenuItem) {
-        showMEM.toggle(); sender.state = showMEM ? .on : .off; refresh()
+        showMEM.toggle(); sender.state = showMEM ? .on : .off; containerBuilt = false; refresh()
     }
     @objc private func toggleSSDItem(_ sender: NSMenuItem) {
-        showSSD.toggle(); sender.state = showSSD ? .on : .off; refresh()
+        showSSD.toggle(); sender.state = showSSD ? .on : .off; containerBuilt = false; refresh()
     }
 
     @objc private func setFontSize(_ sender: NSMenuItem) {
@@ -296,6 +395,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 item.state = (q[0] == p[0] && q[1] == p[1]) ? .on : .off
             }
         }
+        containerBuilt = false
         refresh()
     }
 
