@@ -223,7 +223,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 所有小栈再横向并排。实测总高 19pt，稳稳放进 22pt 状态栏。
         let container = NSStackView()
         container.orientation = .horizontal
-        container.spacing = 7
+        // 列间距。格子本身已带余量，再加 7 会显得散，取 3.5（比原来紧一半）
+        container.spacing = 3.5
         container.alignment = .centerY
         container.translatesAutoresizingMaskIntoConstraints = false
 
@@ -276,7 +277,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let valueFont = NSFont.monospacedDigitSystemFont(ofSize: valueSize, weight: .regular)
         let widestValue = max(width("99" + unit(for: key), font: valueFont),
                               width("--" + unit(for: key), font: valueFont))
-        let cellWidth = max(widestValue, width(label, font: labelField.font!)) + 10
+        // 余量（左右各一半）。和列间距一起决定视觉间距：
+        // 改动前是 spacing 7 + 无格子余量，现在是 3.5 + 5，整体紧了一半。
+        let cellWidth = max(widestValue, width(label, font: labelField.font!)) + 5
 
         // 标签和数值都在单元格里居中；放开约束、只要最小宽度，
         // 文字怎么变都不会把格子撑宽或缩窄。
