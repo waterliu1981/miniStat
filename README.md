@@ -87,6 +87,25 @@ Apple Silicon 上 `AppleSMC` 已经迁到 RTBuddy/SOCD 架构，普通进程能 
 
 字号预设（`⌘` 菜单里可切）：小 18pt / 标准 22pt / 大 22pt —— 都在 22pt 内。
 
+### 状态栏刷新：视图只建一次
+
+早期版本每 2 秒把 statusItem 的 button 子视图全部拆掉，重建 4 组 `NSStackView` + 8 个 `NSTextField`，再 `layoutSubtreeIfNeeded()` 并重设 `statusItem.length`。这会让 AppKit 把整棵视图树离屏光栅化一遍（`_redrawReplicantSnapshot` → `_cacheDisplayInRect` → `CALayer renderInContext` → CoreText 字形绘制），是常驻 CPU 的大头。
+
+现在的做法：
+
+- 视图树**只构建一次**，之后刷新只改 `NSTextField.stringValue`；`lastRenderedValues` 缓存跳过没变化的赋值，避免把 statusItem 标记为重绘。
+- 只有勾选指标或切字号时才重建（`containerBuilt` 标记）。
+- 数值统一成**固定宽度**（百分比两位数、100% 显示为 99%），保证总宽恒定。宽度一变，`statusItem.length` 就会变，进而引发整个菜单栏重排。
+
+实测（`top -l 3 -s 5` 取稳态值）：
+
+| 机器 | 改前 | 改后 |
+|---|---|---|
+| M5 Max / macOS 27.0.1 | 未单独测 | **1.3%–1.9%** |
+| M4（提交时测量，机器有 BTLEServer 占用约 97% 单核干扰） | ~52% | ~49% |
+
+M4 那组数据受干扰，不能代表改动的实际收益；干净环境下的 M5 Max 数据是 1–2% 量级。换机后如需对比，请在**无高负载干扰**的环境下测，并注明机型和系统版本。
+
 ### SSD 占用率：口径陷阱
 
 **不要用 `df /`** —— macOS 上 `/` 是只读系统卷，会报出 ~19% 的假值。真实数据在 `/System/Volumes/Data`，或直接用 `URLResourceValues`（Finder 同款 API）。
