@@ -130,31 +130,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 把某项指标格式化成本次要显示的文字。
-    /// 百分比一律用 2 位定宽（100% 也显示 99%），温度 2 位，
-    /// 保证每个字段的字形宽度恒定 -> 状态栏总宽恒定 -> 不触发菜单栏重排。
+    ///
+    /// 必须严格定宽：`String(format:"%.0f")` 出来的 `0%` / `10%` 宽度不同
+    /// （单位数只有一个数字宽），GPU 一旦上两位数，后面各列就被推着右移，
+    /// 整行重新居中 —— 肉眼就是状态栏跳一下。
+    ///
+    /// 这里改成补零两位（`00%`–`99%`，100% 显示 99%）。全角空格凑位不行：
+    /// 空格 3.38pt、数字 7.56pt（10pt 字号），拼不出等宽。
+    /// 无数据也用 `00` 占位而不用 `--`：`-` 与数字不等宽。
+    /// 实测 100 种取值 + 占位在三种字号下宽度完全一致。
     private func displayValue(for key: MetricKey) -> String {
         switch key {
         case .cpu:
-            if let t = metrics.cpuTemperature {
-                return String(format: "%.0f", min(max(t, 0), 99)) + "°"
-            }
-            return "  °"
+            if let t = metrics.cpuTemperature { return percent(t) + "°" }
+            return "00°"
         case .gpu:
-            if let v = metrics.gpuUtilization {
-                return String(format: "%.0f", min(max(v, 0), 99)) + "%"
-            }
-            return "  %"
+            if let v = metrics.gpuUtilization { return percent(v) + "%" }
+            return "00%"
         case .mem:
-            if let f = metrics.memoryFraction {
-                return String(format: "%.0f", min(max(f * 100, 0), 99)) + "%"
-            }
-            return "  %"
+            if let f = metrics.memoryFraction { return percent(f * 100) + "%" }
+            return "00%"
         case .ssd:
-            if let f = metrics.diskCapacityFraction {
-                return String(format: "%.0f", min(max(f * 100, 0), 99)) + "%"
-            }
-            return "  %"
+            if let f = metrics.diskCapacityFraction { return percent(f * 100) + "%" }
+            return "00%"
         }
+    }
+
+    /// 两位补零、上限 99（100% 也显示 99%，保证不出现 3 位数撑宽）
+    private func percent(_ value: Double) -> String {
+        String(format: "%02.0f", min(max(value, 0), 99))
     }
 
     private func label(for key: MetricKey) -> String {
