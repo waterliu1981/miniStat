@@ -16,6 +16,13 @@ BUILD_DIR="$SRC_DIR/build"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 DEST="$DEST_DIR/$APP_NAME.app"
 
+# 版本号：优先取当前提交的上游 tag（v1.1 → 1.1），取不到就用下面的兜底值。
+# 这样打 tag 发布后，任何人重新编译都会得到一致的版本号。
+FALLBACK_VERSION="1.1"
+VERSION="$(git -C "$SRC_DIR" describe --tags --abbrev=0 2>/dev/null || true)"
+VERSION="${VERSION#v}"
+[[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]] || VERSION="$FALLBACK_VERSION"
+
 echo "==> 环境检查"
 if ! command -v swiftc >/dev/null 2>&1; then
     echo "❌ 未找到 swiftc。请先安装 Xcode 或 Command Line Tools："
@@ -38,7 +45,8 @@ swiftc -O \
     "$SRC_DIR/Sources/$APP_NAME/main.swift"
 
 echo "==> 生成 Info.plist"
-cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
+echo "    版本:   $VERSION"
+cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -54,7 +62,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>$VERSION</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
