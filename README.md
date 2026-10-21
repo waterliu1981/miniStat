@@ -137,6 +137,27 @@ rm -f ~/Library/LaunchAgents/local.waterliu.ministat.plist
 
 ---
 
+## 版本
+
+版本号跟随 git tag：`build.sh` 取当前提交上游最近的 tag（`v1.1` → `1.1`）写进 `CFBundleShortVersionString`，取不到 tag 时用脚本里的兜底值。
+
+在另一台 Mac 上「对齐版本」：
+
+```bash
+git clone https://github.com/waterliu1981/miniStat
+cd miniStat && git checkout v1.1 && bash install.sh
+
+# 装完确认版本
+defaults read ~/Applications/miniStat.app/Contents/Info.plist CFBundleShortVersionString
+```
+
+| 版本 | 内容 |
+|---|---|
+| v1.1 | 状态栏增量刷新（稳态 CPU 1–2%）；四项指标固定单元格宽度，GPU 上两位数时整行不再跳动；列间距收紧 50% |
+| v1.0 | 首个版本：CPU 温度 / GPU / 内存 / SSD 四项，免 root |
+
+---
+
 ## 备注
 
 - **不需要 root，不装守护进程，不改系统文件。**
