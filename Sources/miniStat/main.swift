@@ -67,9 +67,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 行距（负值收紧、正值放松），会并进两行合计高度
     private var lineSpacing: CGFloat = 0
 
-    /// 两行合计高度：标签字号 + 数值字号 + 行距 + 2pt 呼吸空间。
-    /// 标准档 7 + 10 + 0 + 1 = 18pt，状态栏厚度 22〜24pt，留 4–6pt 余量。
-    private var twoLineHeight: CGFloat { labelSize + valueSize + lineSpacing + 1 }
+    /// 单行行高目标值：把两行自然高（标签 8.24 + 数值 11.78 ≈ 20pt）压到
+    /// 略小于状态栏厚度，上下各留一点呼吸空间。
+    ///
+    /// 关键：**必须同时设 minimumLineHeight 和 maximumLineHeight**。
+    /// 只设 minimum 时 AppKit 会按「最大行高」给两行各分配 height，两行合计超出
+    /// 状态栏厚度，标题会被顶到上边缘、下面空一大截（2026-10-21 实测）。
+    /// 成对设成同一个值后总高可控，且居中由 AppKit 自己完成。
+    private var lineHeightTarget: CGFloat {
+        // 状态栏 22pt：两行合计给 20pt（每行 10pt），上下各留 1pt
+        // 其它厚度（如 24pt）按比例放宽，但不小于字体自然高，避免字形被裁。
+        let natural = labelFont().ascender - labelFont().descender
+                   + valueFont().ascender - valueFont().descender
+        let budget = NSStatusBar.system.thickness - 2          // 上下各留 1pt
+        let perLine = min(max((budget + lineSpacing) / 2, natural / 2 + 0.5), 11)
+        return perLine
+    }
 
     /// 标签槽宽度（所有标签补齐到这个宽度）
     private var labelSlot: CGFloat = 0
@@ -291,6 +304,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // 下行：数值，行尾不换行（否则标题底部多一条空行）
         appendRow(out, keys, font: vf, color: valueColor) { self.displayValue(for: $0) }
+        // 整体下移 4pt 做垂直居中。
+        //
+        // 为什么必须手动修正：NSStatusBarButton 的 titleRect 只有 (0, 14, w, 16) ——
+        // 22pt 高的按钮只给它 16pt，且贴着下半部分。两行文字（约 20pt）一旦超出，
+        // AppKit 会把文字**顶部截断式地顶到上边缘**，下方空出一截，看起来就是"没有居中"。
+        // 用 paragraphStyle 的 min/maxLineHeight 调只能改变截断量，无法让整体下移；
+        // baselineOffset 是唯一能把整块文字往下推的手段。
+        // 实测（M4 Air，菜单栏 30pt/60px@2x）：上留白 14px、下留白 13px，差 1px = 0.5pt。
+        out.addAttribute(.baselineOffset, value: -4.0,
+                         range: NSRange(location: 0, length: out.length))
         return out
     }
 
@@ -324,7 +347,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func centeredPara() -> NSParagraphStyle {
         let para = NSMutableParagraphStyle()
         para.alignment = .center
-        para.minimumLineHeight = twoLineHeight / 2
+        let h = lineHeightTarget
+        para.minimumLineHeight = h
+        para.maximumLineHeight = h     // 成对设置，见 lineHeightTarget 注释
         para.lineBreakMode = .byClipping
         return para
     }
