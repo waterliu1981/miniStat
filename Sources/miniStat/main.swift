@@ -131,34 +131,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 把某项指标格式化成本次要显示的文字。
     ///
-    /// 必须严格定宽：`String(format:"%.0f")` 出来的 `0%` / `10%` 宽度不同
-    /// （单位数只有一个数字宽），GPU 一旦上两位数，后面各列就被推着右移，
-    /// 整行重新居中 —— 肉眼就是状态栏跳一下。
+    /// 这里**不**靠补零凑宽度（`00%` 看着别扭），宽度由 makeUnit 里的固定单元格
+    /// 保证：每格宽度按「两位数 + 单位」的最宽情况算出来，数值再怎么变都不撑格。
     ///
-    /// 这里改成补零两位（`00%`–`99%`，100% 显示 99%）。全角空格凑位不行：
-    /// 空格 3.38pt、数字 7.56pt（10pt 字号），拼不出等宽。
-    /// 无数据也用 `00` 占位而不用 `--`：`-` 与数字不等宽。
-    /// 实测 100 种取值 + 占位在三种字号下宽度完全一致。
+    /// 为什么不能只靠数字对齐：`%.0f` 的 `0%` 比 `96%` 窄一个数字宽，
+    /// 数值行 .center 对齐、父栈 .centerX，任何一格变宽都会把整行重新居中 ——
+    /// 肉眼就是 GPU 一上两位数、后面几列被推着右移。
     private func displayValue(for key: MetricKey) -> String {
         switch key {
-        case .cpu:
-            if let t = metrics.cpuTemperature { return percent(t) + "°" }
-            return "00°"
-        case .gpu:
-            if let v = metrics.gpuUtilization { return percent(v) + "%" }
-            return "00%"
-        case .mem:
-            if let f = metrics.memoryFraction { return percent(f * 100) + "%" }
-            return "00%"
-        case .ssd:
-            if let f = metrics.diskCapacityFraction { return percent(f * 100) + "%" }
-            return "00%"
+        case .cpu: return format(metrics.cpuTemperature, unit: "°")
+        case .gpu: return format(metrics.gpuUtilization, unit: "%")
+        case .mem: return format(metrics.memoryFraction.map { $0 * 100 }, unit: "%")
+        case .ssd: return format(metrics.diskCapacityFraction.map { $0 * 100 }, unit: "%")
         }
     }
 
-    /// 两位补零、上限 99（100% 也显示 99%，保证不出现 3 位数撑宽）
-    private func percent(_ value: Double) -> String {
-        String(format: "%02.0f", min(max(value, 0), 99))
+    /// 取整显示，上限 99（100% 也显示 99%，不超过两格数字）。
+    /// 无数据时显示 `--`，与原来一致；宽度由单元格固定，不需要补位。
+    private func format(_ value: Double?, unit: String) -> String {
+        guard let v = value else { return "--" + unit }
+        return String(format: "%.0f", min(max(v, 0), 99)) + unit
+    }
+
+    /// 单位：温度用 `°`，其余都是 `%`
+    private func unit(for key: MetricKey) -> String {
+        key == .cpu ? "°" : "%"
     }
 
     private func label(for key: MetricKey) -> String {
@@ -250,7 +247,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         containerBuilt = true
     }
 
-    /// 一个指标单元：标签在上、数值在下，纵向排列
+    /// 一个指标单元：标签在上、数值在下，纵向排列。
+    ///
+    /// 单元格宽度按「最宽情况」（两位数 + 单位）预先算好并钉死，
+    /// 所以 `40°` 与 `9°`、`0%` 与 `96%` 占的格子一样宽，整行宽度是常量。
     private func makeUnit(_ label: String, _ value: String, key: MetricKey) -> NSView {
         let labelField = NSTextField(labelWithString: label)
         labelField.font = NSFont.systemFont(ofSize: labelSize, weight: .medium)
@@ -271,17 +271,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 缓存起来，后续刷新只改 stringValue
         valueFields[key] = valueField
 
+        // 单元格宽度 = max(两格数字+单位, 标签) + 余量。用等宽数字字体量，
+        // 保证 0–99 个位数/两位数与 `--` 占位都落在同一个宽度里。
+        let valueFont = NSFont.monospacedDigitSystemFont(ofSize: valueSize, weight: .regular)
+        let widestValue = max(width("99" + unit(for: key), font: valueFont),
+                              width("--" + unit(for: key), font: valueFont))
+        let cellWidth = max(widestValue, width(label, font: labelField.font!)) + 10
+
+        // 标签和数值都在单元格里居中；放开约束、只要最小宽度，
+        // 文字怎么变都不会把格子撑宽或缩窄。
+        for field in [labelField, valueField] {
+            field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            field.widthAnchor.constraint(greaterThanOrEqualToConstant: cellWidth).isActive = true
+        }
+
         let stack = NSStackView(views: [labelField, valueField])
         stack.orientation = .vertical
         stack.spacing = lineSpacing     // 负值收紧，正值放松
         stack.alignment = .centerX
+        stack.widthAnchor.constraint(greaterThanOrEqualToConstant: cellWidth).isActive = true
         return stack
     }
 
-    /// 数值部分（不带单位）
-    private func fmtValue(_ value: Double?, decimals: Int) -> String {
-        guard let v = value else { return "--" }
-        return String(format: "%.\(decimals)f", v)
+    /// 量文字宽度（用于算固定单元格宽度）
+    private func width(_ text: String, font: NSFont) -> CGFloat {
+        (text as NSString).size(withAttributes: [.font: font]).width
     }
 
     private func tooltip() -> String {
