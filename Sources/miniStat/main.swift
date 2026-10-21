@@ -153,6 +153,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return String(format: "%.0f", min(max(v, 0), 99)) + unit
     }
 
+    /// 单位：温度用 `°`，其余都是 `%`
+    private func unit(for key: MetricKey) -> String {
+        key == .cpu ? "°" : "%"
+    }
+
     private func label(for key: MetricKey) -> String {
         switch key {
         case .cpu: return "CPU"
@@ -267,7 +272,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         valueFields[key] = valueField
 
         // 单元格宽度 = max(两格数字+单位, 标签) + 余量。用等宽数字字体量，
-        // 保证 0–99 个位数/两位数、`--`、`.` 占位都落在同一个宽度里。
+        // 保证 0–99 个位数/两位数与 `--` 占位都落在同一个宽度里。
         let valueFont = NSFont.monospacedDigitSystemFont(ofSize: valueSize, weight: .regular)
         let widestValue = max(width("99" + unit(for: key), font: valueFont),
                               width("--" + unit(for: key), font: valueFont))
