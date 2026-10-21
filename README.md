@@ -187,7 +187,32 @@ rm -f ~/Library/LaunchAgents/local.waterliu.ministat.plist
 
 ## 版本
 
-版本号跟随 git tag：`build.sh` 取当前提交上游最近的 tag（`v1.1.1` → `1.1.1`）写进 `CFBundleShortVersionString`，取不到 tag 时用脚本里的兜底值。
+版本号跟随 git tag：`build.sh` 用 `git tag --points-at HEAD` 取**当前提交上的** tag（`v1.1.1` → `1.1.1`）写进 `CFBundleShortVersionString`。
+
+**当前提交没有 tag 时，`build.sh` 会拒绝构建**并提示先打 tag。这是有意的——早期用的 `git describe --abbrev=0` 会取"最近的一个 tag"，即使 HEAD 已经领先它很多提交也照用，于是构建出来的 `.app` 顶着旧版本号。
+
+发布流程：
+
+```bash
+# 1. 合并到 main
+git checkout main && git merge --no-ff <branch>
+
+# 2. 在 main 上打 tag（必须指向要发布的那个提交）
+git tag -a v1.1.2 -m "v1.1.2 — 变更说明"
+
+# 3. 构建（此时 HEAD 有 tag，能通过检查）
+./build.sh
+
+# 4. 推送
+git push origin main && git push origin v1.1.2
+gh release create v1.1.2 --title "..." --notes-file <notes>
+```
+
+只想临时构建、不需要正确版本号时：
+
+```bash
+SKIP_TAG_CHECK=1 ./build.sh     # 使用 build.sh 里的兜底版本号
+```
 
 在另一台 Mac 上「对齐版本」：
 

@@ -16,12 +16,44 @@ BUILD_DIR="$SRC_DIR/build"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 DEST="$DEST_DIR/$APP_NAME.app"
 
-# 版本号：优先取当前提交上游最近的 tag（v1.1.1 → 1.1.1），取不到就用下面的兜底值。
-# 这样打 tag 发布后，任何人重新编译都会得到一致的版本号。
+# 版本号：取「当前提交」上的 tag（v1.1.1 → 1.1.1）。
+#
+# 注意这里用的是 `--points-at HEAD` 而不是 `--abbrev=0`：
+# 后者会取最近的一个 tag，即使当前 HEAD 已经领先它很多提交也会照用，
+# 于是构建出来的 .app 顶着旧版本号 —— 之前踩过这个坑。
+# 现在要求 HEAD 正好被某个 tag 指向，否则直接报错退出。
+#
+# 想跳过检查（临时构建、调试用）可以：
+#   SKIP_TAG_CHECK=1 ./build.sh        # 用兜底版本号
 FALLBACK_VERSION="1.1.1"
-VERSION="$(git -C "$SRC_DIR" describe --tags --abbrev=0 2>/dev/null || true)"
-VERSION="${VERSION#v}"
-[[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]] || VERSION="$FALLBACK_VERSION"
+
+TAG_AT_HEAD="$(git -C "$SRC_DIR" tag --points-at HEAD 2>/dev/null | sort -V | tail -1 || true)"
+if [[ -n "$TAG_AT_HEAD" ]]; then
+    VERSION="${TAG_AT_HEAD#v}"
+else
+    if [[ "${SKIP_TAG_CHECK:-0}" == "1" ]]; then
+        VERSION="$FALLBACK_VERSION"
+        echo "⚠️  当前提交没有 tag，按 SKIP_TAG_CHECK=1 使用兜底版本号 $VERSION"
+    else
+        echo "❌ 当前提交（$(git -C "$SRC_DIR" rev-parse --short HEAD)）没有被打 tag，拒绝构建。"
+        echo ""
+        echo "   版本号来自 tag，直接构建会得到错误（或兜底的旧）版本号。请先打 tag："
+        echo ""
+        echo "     git tag -a v1.1.2 -m \"v1.1.2 — 变更说明\""
+        echo "     ./build.sh"
+        echo ""
+        echo "   如果只是临时构建、不需要正确版本号，可以："
+        echo ""
+        echo "     SKIP_TAG_CHECK=1 ./build.sh"
+        echo ""
+        exit 1
+    fi
+fi
+
+if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+    echo "❌ tag「$TAG_AT_HEAD」不是合法的版本号（应形如 v1.2.3）"
+    exit 1
+fi
 
 echo "==> 环境检查"
 if ! command -v swiftc >/dev/null 2>&1; then
