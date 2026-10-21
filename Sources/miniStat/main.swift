@@ -24,40 +24,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let temperatureReader = TemperatureReader()
 
-    // MARK: 视图缓存（性能关键）
+    // MARK: 渲染方式（性能关键）
     //
-    // 状态栏刷新曾经的做法是：每 2 秒把 button 的子视图全部拆掉、重建 4 组
-    // NSStackView + 8 个 NSTextField，再 layoutSubtreeIfNeeded() + 改 statusItem.length。
-    // 每次都触发 AppKit 把整棵视图树离屏光栅化成位图（_redrawReplicantSnapshot
-    // -> _cacheDisplayInRect -> CALayer renderInContext -> CoreText 字形绘制），
-    // 实测吃掉 50% CPU。
+    // 演进历程（每一版都是在上一版实测后改的）：
     //
-    // 现在改成：视图只建一次，后续刷新只改 NSTextField.stringValue。
-    // 文字没变化的字段不赋值，NSStatusItem 就不会被标记为需要重绘。
+    // v1.0：每 2 秒拆掉重建 4 组 NSStackView + 8 个 NSTextField，再改 statusItem.length。
+    // v1.1：视图只建一次、刷新只改 stringValue —— 实测仍约 50% CPU。
     //
-    // 另一点：数值一律固定宽度（2 位百分比 + 2 位温度，100% 显示 99%），
-    // 保证状态栏总宽恒定，避免 length 变化引发整个菜单栏重排。
+    // v1.1 仍慢的原因：只要 NSStatusItem 有自定义子视图，它每次刷新都会走
+    //   _updateReplicants -> _redrawReplicantSnapshot -> _cacheDisplayInRect:toBitmapImageRep:
+    //   -> CALayer renderInContext -> CoreText 字形，把整条状态栏**用 CPU 软件光栅化**成位图。
+    // 而且这条路径与“文字有没有变”无关：控制台定时器一 tick，就会被重投递放大，
+    // 采样里看到 ~1000 次/秒的重绘。像素量 × 屏幕数，本机双 4K 下约 50% 单核。
+    //
+    // 现在改成：不再往 button 里塞任何子视图，改用 button.attributedTitle 做单行排版。
+    // AppKit 对 title 走的是轻量文字替换，不触发上面那条离屏光栅化路径。
+    //
+    // 另外三条配套规则：
+    //   · statusItem.length 固定，不用 variableLength（宽度一变整个菜单栏重排）；
+    //   · 定时器 5 秒起，tolerance 1 秒（状态栏监控不需要秒级刷新）；
+    //   · toolTip 内容没变就不赋值（赋值也是重绘触发点）。
+    //
+    // 宽度恒定：每个指标占一个固定宽度的格（按键位宽度 + 余量算好），
+    // 用 monospacedDigit 字体 + 逐个字段的 .kern 把每格撑到恰好 cellWidth，
+    // 所以 0% 与 99%、--° 都落在同一个盒子里，整条标题宽度是常量。
 
-    /// 每个指标单元对应的数值 label，key 用于查找
     private enum MetricKey: String, CaseIterable {
         case cpu, gpu, mem, ssd
     }
 
-    private var valueFields: [MetricKey: NSTextField] = [:]
     /// 已渲染的数值缓存，用于跳过无变化的赋值
     private var lastRenderedValues: [MetricKey: String] = [:]
-    /// 容器是否已构建
-    private var containerBuilt = false
+    /// 已应用的排版配置，变化时才重算定宽（不触发刷新）
+    private var appliedLayoutKey: String?
+    /// 已设置过的 toolTip，内容相同就不重复赋值
+    private var lastToolTip: String?
 
     /// 采样间隔（秒）
-    private var interval: TimeInterval = 2.0
+    private var interval: TimeInterval = 5.0
+
+    /// 标签槽宽度（所有标签补齐到这个宽度）
+    private var labelSlot: CGFloat = 0
+    /// 数值槽宽度（所有数值补齐到这个宽度，保证 9° 与 99° 同宽）
+    private var valueSlot: CGFloat = 0
 
     /// 字号：标签（上行，小字）与数值（下行，大字）
     /// 状态栏厚度 22pt。实测：标签 7 + 数值 10 + 行距 0 => 恰好 22pt，
     /// 行距 +1 就会超（23pt）导致上行被切。所以 0 是最舒展且安全的取值。
     private var labelSize: CGFloat = 7
     private var valueSize: CGFloat = 10
-    private var lineSpacing: CGFloat = 0
 
     private var showCPU = true
     private var showGPU = true
@@ -67,7 +82,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: 生命周期
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // variableLength 会随标题宽度变化触发菜单栏重排；这里算好宽度后钉死。
+        statusItem = NSStatusBar.system.statusItem(withLength: 0)
         statusItem.button?.imagePosition = .noImage
 
         buildMenu()
@@ -87,11 +103,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startTimer() {
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+        let t = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.refresh()
         }
-        timer?.tolerance = 0.5
-        RunLoop.current.add(timer!, forMode: .common)
+        // 容差 1 秒（或间隔的 20%，取大者）：给系统合并唤醒的机会，省电。
+        t.tolerance = max(1.0, interval * 0.2)
+        timer = t
+        RunLoop.current.add(t, forMode: .common)
     }
 
     // MARK: 采样
@@ -131,7 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 把某项指标格式化成本次要显示的文字。
     ///
-    /// 这里**不**靠补零凑宽度（`00%` 看着别扭），宽度由 makeUnit 里的固定单元格
+    /// 这里**不**靠补零凑宽度（`00%` 看着别扭），宽度由 buildTitle 里的固定单元格
     /// 保证：每格宽度按「两位数 + 单位」的最宽情况算出来，数值再怎么变都不撑格。
     ///
     /// 为什么不能只靠数字对齐：`%.0f` 的 `0%` 比 `96%` 窄一个数字宽，
@@ -167,134 +185,147 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: 渲染（attributedTitle，单行定宽）
+
+    /// 排版配置指纹：字号/行距/是否全隐藏。变了才重算定宽。
+    private var layoutKey: String {
+        "\(labelSize)/\(valueSize)/\(activeKeys.map { $0.rawValue }.joined())"
+    }
+
+    /// 状态栏可用高度（菜单栏厚度，通常 22 或 24）
+    private var barHeight: CGFloat {
+        NSScreen.main?.frame.height == 0 ? 22 : NSStatusBar.system.thickness
+    }
+
     private func render() {
         guard let button = statusItem.button else { return }
-
-        button.imagePosition = .noImage
-
         let keys = activeKeys
 
-        // 首次或被切掉/恢复时重建整棵视图树；其余情况只改文字。
-        if !containerBuilt {
-            rebuildContainer(keys: keys)
+        // 1. 排版/宽度：只在配置或字体变化时算一次
+        if appliedLayoutKey != layoutKey {
+            applyLayout(keys: keys)
         }
 
-        // 只更新文字，不重建视图。文字没变化的字段不赋值，
-        // AppKit 就不会把 NSStatusItem 标记为需要重绘。
+        // 2. 文字：没变就不重设，避免无谓的重绘
         var changed = false
         for key in keys {
             let text = displayValue(for: key)
             if lastRenderedValues[key] != text {
-                valueFields[key]?.stringValue = text
                 lastRenderedValues[key] = text
                 changed = true
             }
         }
+        if changed || appliedTitle == nil {
+            let title = buildTitle(keys: keys)
+            if title.string != appliedTitle {
+                button.attributedTitle = title
+                appliedTitle = title.string
+            }
+        }
 
-        if changed {
-            button.toolTip = tooltip()
+        // 3. toolTip：内容相同就不赋值（赋值同样是重绘触发点）
+        let tip = tooltip()
+        if tip != lastToolTip {
+            button.toolTip = tip
+            lastToolTip = tip
         }
     }
 
-    /// 构建一次视图树（仅在启动 / 勾选项变化 / 字号变化时调用）
-    private func rebuildContainer(keys: [MetricKey]) {
-        guard let button = statusItem.button else { return }
+    /// 已应用的标题文本，用于对比跳过
+    private var appliedTitle: String?
 
-        for sub in button.subviews { sub.removeFromSuperview() }
-        valueFields.removeAll()
+    /// 计算并应用定宽、statusItem.length。不触发状态栏重绘。
+    private func applyLayout(keys: [MetricKey]) {
+        appliedLayoutKey = layoutKey
+        appliedTitle = nil
         lastRenderedValues.removeAll()
-        button.attributedTitle = NSAttributedString(string: "")
 
-        if keys.isEmpty {
-            let title = NSTextField(labelWithString: "miniStat")
-            title.font = NSFont.systemFont(ofSize: 11)
-            title.translatesAutoresizingMaskIntoConstraints = false
-            button.addSubview(title)
-            NSLayoutConstraint.activate([
-                title.centerXAnchor.constraint(equalTo: button.centerXAnchor),
-                title.centerYAnchor.constraint(equalTo: button.centerYAnchor)
-            ])
-            statusItem.length = NSStatusItem.variableLength
-            containerBuilt = true
+        guard !keys.isEmpty else {
+            statusItem.length = width("miniStat", font: NSFont.systemFont(ofSize: 11)) + 12
             return
         }
 
-        // 布局方式：每个指标是一个「竖排小栈」（标签在上、数值在下），
-        // 所有小栈再横向并排。实测总高 19pt，稳稳放进 22pt 状态栏。
-        let container = NSStackView()
-        container.orientation = .horizontal
-        // 列间距。格子本身已带余量，再加 7 会显得散，取 3.5（比原来紧一半）
-        container.spacing = 3.5
-        container.alignment = .centerY
-        container.translatesAutoresizingMaskIntoConstraints = false
+        let lf = labelFont(), vf = valueFont()
 
+        // 标签槽 = 最宽标签
+        labelSlot = keys.map { width(label(for: $0), font: lf) }.max() ?? 0
+        // 数值槽 = 最宽数值形态（两位数字 + 单位，或无数据时的 --）
+        var v: CGFloat = 0
         for key in keys {
-            let initial = displayValue(for: key)
-            let unit = makeUnit(label(for: key), initial, key: key)
-            container.addArrangedSubview(unit)
-            lastRenderedValues[key] = initial
+            let u = unit(for: key)
+            v = max(v, width("99" + u, font: vf), width("--" + u, font: vf))
         }
+        valueSlot = v
 
-        button.addSubview(container)
-        container.layoutSubtreeIfNeeded()
-        let fit = container.fittingSize
-        statusItem.length = fit.width + 12
-        NSLayoutConstraint.activate([
-            container.leadingAnchor.constraint(equalTo: button.leadingAnchor, constant: 6),
-            container.centerYAnchor.constraint(equalTo: button.centerYAnchor)
-        ])
-
-        button.toolTip = tooltip()
-        containerBuilt = true
+        let total = CGFloat(keys.count) * itemWidth + CGFloat(keys.count - 1) * width("  ", font: lf)
+        statusItem.length = total + 12   // 左右各 6pt 内边距
     }
 
-    /// 一个指标单元：标签在上、数值在下，纵向排列。
+    /// 拼出单行标题：`CPU 38°  GPU 31%  MEM 60%  SSD 78%`。
     ///
-    /// 单元格宽度按「最宽情况」（两位数 + 单位）预先算好并钉死，
-    /// 所以 `40°` 与 `9°`、`0%` 与 `96%` 占的格子一样宽，整行宽度是常量。
-    private func makeUnit(_ label: String, _ value: String, key: MetricKey) -> NSView {
-        let labelField = NSTextField(labelWithString: label)
-        labelField.font = NSFont.systemFont(ofSize: labelSize, weight: .medium)
-        // 标签也用白色高不透明度：secondaryLabelColor 的 alpha 只有 0.55，
-        // 在深色菜单栏上会发灰发暗，看起来像黑色。
-        labelField.textColor = NSColor.white.withAlphaComponent(0.92)
-        labelField.alignment = .center
-        labelField.isBezeled = false
-        labelField.drawsBackground = false
-
-        let valueField = NSTextField(labelWithString: value)
-        valueField.font = NSFont.monospacedDigitSystemFont(ofSize: valueSize, weight: .regular)
-        valueField.textColor = NSColor.white
-        valueField.alignment = .center
-        valueField.isBezeled = false
-        valueField.drawsBackground = false
-
-        // 缓存起来，后续刷新只改 stringValue
-        valueFields[key] = valueField
-
-        // 单元格宽度 = max(两格数字+单位, 标签) + 余量。用等宽数字字体量，
-        // 保证 0–99 个位数/两位数与 `--` 占位都落在同一个宽度里。
+    /// 为什么从两行改成单行：两行要同时维护「上行标签」「下行数值」两条居中轴线，
+    /// 任何一行宽度变化都会让另一行整体平移；而 AppKit 状态栏标题不支持逐格定宽
+    /// （空格会被压缩、kern 会被按 run 长度相乘），两行方案必然出现水平错位。
+    /// 单行只有一条轴线，再加「标签槽 + 数值槽」两级定宽，宽度就是常量。
+    private func buildTitle(keys: [MetricKey]) -> NSAttributedString {
+        let labelFont = NSFont.systemFont(ofSize: labelSize, weight: .medium)
         let valueFont = NSFont.monospacedDigitSystemFont(ofSize: valueSize, weight: .regular)
-        let widestValue = max(width("99" + unit(for: key), font: valueFont),
-                              width("--" + unit(for: key), font: valueFont))
-        // 余量（左右各一半）。和列间距一起决定视觉间距：
-        // 改动前是 spacing 7 + 无格子余量，现在是 3.5 + 5，整体紧了一半。
-        let cellWidth = max(widestValue, width(label, font: labelField.font!)) + 5
+        let labelColor = NSColor.white.withAlphaComponent(0.92)
+        let valueColor = NSColor.white
 
-        // 标签和数值都在单元格里居中；放开约束、只要最小宽度，
-        // 文字怎么变都不会把格子撑宽或缩窄。
-        for field in [labelField, valueField] {
-            field.setContentHuggingPriority(.defaultLow, for: .horizontal)
-            field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-            field.widthAnchor.constraint(greaterThanOrEqualToConstant: cellWidth).isActive = true
+        let out = NSMutableAttributedString()
+        for (i, key) in keys.enumerated() {
+            // 标签槽：补齐到最宽标签，右对齐贴向数值
+            let lbl = label(for: key)
+            out.append(NSAttributedString(string: lbl, attributes: [.font: labelFont, .foregroundColor: labelColor]))
+            out.append(NSAttributedString(string: padding(to: labelSlot - width(lbl, font: labelFont), font: labelFont),
+                                          attributes: [.font: labelFont]))
+            // 标签与数值之间一个空格
+            out.append(NSAttributedString(string: " ", attributes: [.font: labelFont]))
+            // 数值槽：先放数值，再补齐到最宽数值，保证 9° 与 99° 同宽
+            let val = displayValue(for: key)
+            out.append(NSAttributedString(string: val, attributes: [.font: valueFont, .foregroundColor: valueColor]))
+            out.append(NSAttributedString(string: padding(to: valueSlot - width(val, font: valueFont), font: valueFont),
+                                          attributes: [.font: valueFont]))
+            // 项间分隔：两个空格（最后一格不加，保持右边缘对称）
+            if i != keys.count - 1 {
+                out.append(NSAttributedString(string: "  ", attributes: [.font: labelFont]))
+            }
         }
+        return out
+    }
 
-        let stack = NSStackView(views: [labelField, valueField])
-        stack.orientation = .vertical
-        stack.spacing = lineSpacing     // 负值收紧，正值放松
-        stack.alignment = .centerX
-        stack.widthAnchor.constraint(greaterThanOrEqualToConstant: cellWidth).isActive = true
-        return stack
+    /// 用多种宽度的空格贪心补齐到指定宽度。
+    /// AppKit 会压缩连续空格，所以这里用不同宽度的空白字符（em/半em/thin/hair）
+    /// 拼出接近目标宽度的补偿，误差小于 1 个 hair space（约 0.7pt）。
+    private func padding(to target: CGFloat, font: NSFont) -> String {
+        guard target > 0 else { return "" }
+        var rem = target
+        var s = ""
+        for p in Self.padCharacters {
+            let pw = width(p, font: font)
+            guard pw > 0 else { continue }
+            let n = Int((rem / pw).rounded(.down))
+            if n > 0 {
+                s += String(repeating: p, count: n)
+                rem -= CGFloat(n) * pw
+            }
+        }
+        return s
+    }
+
+    /// 补齐用的空白字符，从宽到窄
+    private static let padCharacters: [String] = ["\u{2003}", "\u{2002}", "\u{2009}", "\u{200A}"]
+
+    /// 每个指标占用的固定宽度（标签槽 + 空格 + 数值槽）
+    private var itemWidth: CGFloat { labelSlot + width(" ", font: labelFont()) + valueSlot }
+
+    private func labelFont() -> NSFont {
+        NSFont.systemFont(ofSize: labelSize, weight: .medium)
+    }
+
+    private func valueFont() -> NSFont {
+        NSFont.monospacedDigitSystemFont(ofSize: valueSize, weight: .regular)
     }
 
     /// 量文字宽度（用于算固定单元格宽度）
@@ -359,15 +390,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 字号档位：同时给出「标签 + 数值 + 行距」三件套，
         // 保证加起来不超过状态栏 22pt 厚度
         let sizeMenu = NSMenu()
-        let presets: [(String, CGFloat, CGFloat, CGFloat)] = [
-            ("小",   6, 9,  -1),
-            ("标准", 7, 10,  0),
-            ("大",   7, 11, -1)
+        // (标题, 标签字号, 数值字号)。单行排版后不再需要行距参数：
+        // 高度要么放得下要么放不下，由菜单栏厚度决定，不需要用行距去凑。
+        let presets: [(String, CGFloat, CGFloat)] = [
+            ("小",   6, 9),
+            ("标准", 7, 10),
+            ("大",   7, 11)
         ]
-        for (title, l, v, sp) in presets {
+        for (title, l, v) in presets {
             let item = NSMenuItem(title: title, action: #selector(setFontSize(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = [l, v, sp]
+            item.representedObject = [l, v]
             item.state = (l == labelSize && v == valueSize) ? .on : .off
             sizeMenu.addItem(item)
         }
@@ -397,27 +430,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleCPUItem(_ sender: NSMenuItem) {
-        showCPU.toggle(); sender.state = showCPU ? .on : .off; containerBuilt = false; refresh()
+        showCPU.toggle(); sender.state = showCPU ? .on : .off; refresh()
     }
     @objc private func toggleGPUItem(_ sender: NSMenuItem) {
-        showGPU.toggle(); sender.state = showGPU ? .on : .off; containerBuilt = false; refresh()
+        showGPU.toggle(); sender.state = showGPU ? .on : .off; refresh()
     }
     @objc private func toggleMEMItem(_ sender: NSMenuItem) {
-        showMEM.toggle(); sender.state = showMEM ? .on : .off; containerBuilt = false; refresh()
+        showMEM.toggle(); sender.state = showMEM ? .on : .off; refresh()
     }
     @objc private func toggleSSDItem(_ sender: NSMenuItem) {
-        showSSD.toggle(); sender.state = showSSD ? .on : .off; containerBuilt = false; refresh()
+        showSSD.toggle(); sender.state = showSSD ? .on : .off; refresh()
     }
 
     @objc private func setFontSize(_ sender: NSMenuItem) {
-        guard let p = sender.representedObject as? [CGFloat], p.count == 3 else { return }
-        labelSize = p[0]; valueSize = p[1]; lineSpacing = p[2]
+        guard let p = sender.representedObject as? [CGFloat], p.count == 2 else { return }
+        labelSize = p[0]; valueSize = p[1]
         for item in sender.menu?.items ?? [] {
-            if let q = item.representedObject as? [CGFloat], q.count == 3 {
+            if let q = item.representedObject as? [CGFloat], q.count == 2 {
                 item.state = (q[0] == p[0] && q[1] == p[1]) ? .on : .off
             }
         }
-        containerBuilt = false
         refresh()
     }
 
