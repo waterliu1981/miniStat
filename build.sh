@@ -16,9 +16,9 @@ BUILD_DIR="$SRC_DIR/build"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 DEST="$DEST_DIR/$APP_NAME.app"
 
-# 版本号：优先取当前提交的上游 tag（v1.1 → 1.1），取不到就用下面的兜底值。
+# 版本号：优先取当前提交上游最近的 tag（v1.1.1 → 1.1.1），取不到就用下面的兜底值。
 # 这样打 tag 发布后，任何人重新编译都会得到一致的版本号。
-FALLBACK_VERSION="1.1"
+FALLBACK_VERSION="1.1.1"
 VERSION="$(git -C "$SRC_DIR" describe --tags --abbrev=0 2>/dev/null || true)"
 VERSION="${VERSION#v}"
 [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]] || VERSION="$FALLBACK_VERSION"

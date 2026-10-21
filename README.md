@@ -77,34 +77,82 @@ Apple Silicon 上 `AppleSMC` 已经迁到 RTBuddy/SOCD 架构，普通进程能 
 1. `IOHIDEventSystemClientSetMatching` 返回 `Void`（不是 `Int32`）—— 搞错会段错误。
 2. **必须持有 `IOHIDEventSystemClient`** —— 服务引用只在 client 存活期间有效，client 释放后访问服务会 `SIGBUS`。
 
-### 状态栏版式：为什么用 NSStackView
+### 状态栏版式：为什么改用 attributedTitle
 
-状态栏厚度只有 **22pt**。两行必须严格压在这个高度内。
+v1.1.1 之前用 `NSStackView` 嵌套子视图（每个指标一个竖排小栈，再横向并排）。能显示，但**性能代价很高**，而且不是调参能解决的：
 
-- 用 attributed string 拼多个含 `\n` 的单元**不行** —— 每个单元会被推到新的一行（实测每加一个单元高度 +13pt）。
-- 正确做法是 `NSStackView` 嵌套：每个指标一个竖排小栈，再横向并排。总高实测 **19pt**。
-- 显式设 `statusItem.length` —— `variableLength` 不会根据子视图自动撑宽，会塌成 0 宽。
+> 只要 `NSStatusItem` 里塞的是自定义子视图，AppKit 每次刷新都会走
+> `_updateReplicants` → `_redrawReplicantSnapshot:` → `_cacheDisplayInRect:toBitmapImageRep:`
+> → `CALayer renderInContext` → CoreText 字形绘制
+>
+> 也就是**用 CPU 把整条状态栏软件光栅化成位图**。这条路径与"文字有没有变"无关，
+> 2 秒一次的定时器会被放大成每秒上千次重绘。双 4K 外接屏（非镜像）下，
+> 实测吃满 **50.9% 单核**。
 
-字号预设（`⌘` 菜单里可切）：小 18pt / 标准 22pt / 大 22pt —— 都在 22pt 内。
+v1.1.1 改为 `button.attributedTitle` 两行排版（`CPU/GPU/MEM/SSD` 在上、数值在下），不再有任何子视图。AppKit 对 title 走轻量文字替换，不触发上面那条路径。
 
-### 状态栏刷新：视图只建一次
+中间试过单行排版，CPU 能降到 0.63%，但两行版式更接近 iStat、信息密度更高，所以最终保留两行——代价只是 1.67%（见下表）。
 
-早期版本每 2 秒把 statusItem 的 button 子视图全部拆掉，重建 4 组 `NSStackView` + 8 个 `NSTextField`，再 `layoutSubtreeIfNeeded()` 并重设 `statusItem.length`。这会让 AppKit 把整棵视图树离屏光栅化一遍（`_redrawReplicantSnapshot` → `_cacheDisplayInRect` → `CALayer renderInContext` → CoreText 字形绘制），是常驻 CPU 的大头。
+#### 两行怎么保证上下对齐
 
-现在的做法：
+上下两行各自居中时，只要两行总宽不同，就会整体平移。解决办法是**两行共用同一套格宽**：
 
-- 视图树**只构建一次**，之后刷新只改 `NSTextField.stringValue`；`lastRenderedValues` 缓存跳过没变化的赋值，避免把 statusItem 标记为重绘。
-- 只有勾选指标或切字号时才重建（`containerBuilt` 标记）。
-- 数值统一成**固定宽度**（百分比两位数、100% 显示为 99%），保证总宽恒定。宽度一变，`statusItem.length` 就会变，进而引发整个菜单栏重排。
+- 每格宽度 `cellWidth = max(最宽标签, 最宽数值形态) + cellPad`
+- 项与项之间用**数值字体的空格**做分隔（两行用同一个字体量，否则差几个 pt）
+- 格内剩余宽度用**多档宽度的空白字符**补齐：`U+2003`(em) / `U+2002`(½em) / `U+2009`(thin) / `U+200A`(hair)
+- `cellPad = 4.78` 不是随手取的：两行补位字符宽度不同（标签字体 hair=0.706pt、数值字体 hair=0.820pt），这个值是对 **0–99 全部取值暴力搜索**出来的，使两行对齐误差最小
 
-实测（`top -l 3 -s 5` 取稳态值）：
+最终两行最大错位 **0.28pt**，小于一个物理像素（@2x 下 0.5pt）。
 
-| 机器 | 改前 | 改后 |
+#### 为什么 `baselineOffset = -4` 是必须的
+
+> 这是 v1.1.1 修掉的第二个坑：文字看着"贴着上边缘、下面空一截"。
+
+`NSStatusBarButton` 的 `titleRect(forBounds:)` 实测返回 **`(0, 14, w, 16)`** —— 按钮高 22pt，但系统只给标题 **16pt**，且贴着下半部分。两行文字自然高约 20pt，超出后 AppKit 会把文字**顶部截断式地顶到上边缘**，留白全塌在底部。
+
+试过无效的：
+
+| 做法 | 结果 |
+|---|---|
+| 只设 `minimumLineHeight` | 仍贴顶（单选 min 时按最大行高分配） |
+| `minimum` + `maximum` 成对设 | 总高可控了，**位置没变**，只是留白从上面挪到下面 |
+| 两行都用同一字体 | 仍偏上 16px，与字体不对称无关 |
+| 离线用 `NSButton` 渲染同样标题 | **是居中的**，说明问题只出在 `NSStatusBarButton` |
+
+结论：段落样式只能改"截断多少"，**不能让文字块整体下移**。唯一手段是 `.baselineOffset`。
+
+实测取值（M4 Air，菜单栏 30pt / 60px@2x）：
+
+| baselineOffset | 上留白 | 下留白 |
 |---|---|---|
-| M5 Max / macOS 27.0.1 | 未单独测 | **1.3%–1.9%** |
-| M4（提交时测量，机器有 BTLEServer 占用约 97% 单核干扰） | ~52% | ~49% |
+| -2.0 | 10px | 17px |
+| -3.75 | 14px | 13px |
+| **-4.0** | **14px** | **13px** |
+| -4.25 | 15px | 12px |
 
-M4 那组数据受干扰，不能代表改动的实际收益；干净环境下的 M5 Max 数据是 1–2% 量级。换机后如需对比，请在**无高负载干扰**的环境下测，并注明机型和系统版本。
+最终 **-4.0**，上下差 1px（0.5pt，@2x 最小可调单位）。
+
+> ⚠️ 这个补偿量绑在「22pt 按钮 + 7/10pt 字号」组合上。换到菜单栏更高的系统、或切到"大"字号档时可能需要微调。
+
+字号预设（`⌘` 菜单里可切）：小 6/9pt、标准 7/10pt、大 7/11pt。
+
+### 状态栏刷新策略
+
+- 刷新间隔默认 **2 秒**（菜单里可选 1 / 2 / 3 / 5 / 10 秒），`tolerance = max(1s, 间隔×20%)`，给系统合并唤醒的机会。
+- **`statusItem.length` 固定**（启动时按格宽算好后钉死），不用 `variableLength`——宽度一变整个菜单栏都要重排。
+- 数值没变化时不重设标题；`toolTip` 内容没变也不赋值（赋值同样是重绘触发点）。
+
+#### 实测（上下两行版式 + 2 秒刷新）
+
+| 机器 | 版本 | 单核占用 |
+|---|---|---|
+| M4 Air / 双 4K 外接屏非镜像 / 10 核 | v1.1（NSStackView） | **50.9%** |
+| 同上 / 5 秒刷新 / 单行版（中间实验） | — | 0.63% |
+| 同上 / **2 秒刷新 / 两行** | **v1.1.1** | **1.67%** |
+
+`sample` 抓栈确认：剩余开销基本全是 IOKit 传感读数本身（`GPUReader` 走 `ioreg`、`TemperatureReader` 走 `io_hideventsystem_copy_event_for_service`、`DiskCapacityReader` 走 `CFURLCopyResourcePropertiesForKeys`），渲染已不是瓶颈。
+
+换机对比请在**无高负载干扰**的环境下测，并注明机型、系统版本和屏幕配置。
 
 ### SSD 占用率：口径陷阱
 
@@ -139,13 +187,13 @@ rm -f ~/Library/LaunchAgents/local.waterliu.ministat.plist
 
 ## 版本
 
-版本号跟随 git tag：`build.sh` 取当前提交上游最近的 tag（`v1.1` → `1.1`）写进 `CFBundleShortVersionString`，取不到 tag 时用脚本里的兜底值。
+版本号跟随 git tag：`build.sh` 取当前提交上游最近的 tag（`v1.1.1` → `1.1.1`）写进 `CFBundleShortVersionString`，取不到 tag 时用脚本里的兜底值。
 
 在另一台 Mac 上「对齐版本」：
 
 ```bash
 git clone https://github.com/waterliu1981/miniStat
-cd miniStat && git checkout v1.1 && bash install.sh
+cd miniStat && git checkout v1.1.1 && bash install.sh
 
 # 装完确认版本
 defaults read ~/Applications/miniStat.app/Contents/Info.plist CFBundleShortVersionString
@@ -153,6 +201,7 @@ defaults read ~/Applications/miniStat.app/Contents/Info.plist CFBundleShortVersi
 
 | 版本 | 内容 |
 |---|---|
+| v1.1.1 | **性能大修**：状态栏改为 `attributedTitle` 两行排版，去掉 NSStackView/NSTextField 子视图，绕开 AppKit 每次刷新都做的离屏软件光栅化；单核占用 50.9% → 1.67%。**修复垂直居中**：`NSStatusBarButton.titleRect` 只有 16pt 高，用 `baselineOffset = -4` 修正。`statusItem.length` 固定；刷新默认 2 秒并带 tolerance；toolTip 去抖 |
 | v1.1 | 状态栏增量刷新（稳态 CPU 1–2%）；四项指标固定单元格宽度，GPU 上两位数时整行不再跳动；列间距收紧 50% |
 | v1.0 | 首个版本：CPU 温度 / GPU / 内存 / SSD 四项，免 root |
 
